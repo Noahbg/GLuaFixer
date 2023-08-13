@@ -18,6 +18,7 @@ src = lib.cleanSourceWith {
       ];
       suffixDenylist = [
         "release-linux.sh"
+        "release-darwin.sh"
         "nix"
         "installation-instructions"
       ];

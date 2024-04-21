@@ -16,6 +16,7 @@ import qualified Data.Set as S
 import qualified Data.Map.Strict as M
 import Data.Char (isLower, isUpper)
 import Data.Maybe
+import GLua.Position (LineColPos(..), Region(..))
 import GLuaFixer.LintMessage
 import GLuaFixer.LintSettings
 }
@@ -148,7 +149,7 @@ attr AllStuff MToken MTokenList
 attr Block
     inh isRepeat :: Bool -- Scopes should not be popped and certain errors are not to be thrown when this is the body of a repeat
 
-attr AllStuff MToken MTokenList Token TokenList Region
+attr AllStuff MToken MTokenList Token
     syn warnings use {++} {[]} :: {[String -> LintMessage]}
     syn copy :: self
     syn identifier use {const} {unknownIdentifier} :: String -- identifier of the first token
@@ -223,11 +224,11 @@ sem Token
 
 sem MToken
     | MToken
-        lhs.mtokenPos           = @mpos.copy
+        lhs.mtokenPos           = @mpos
         lhs.mtok                = @mtok.copy
         lhs.identifier          = @mtok.identifier
         +warnings               = if not (lint_goto_identifier @lhs.config) || @mtok.identifier /= "goto" then id else
-                                    (:) $ warn @mpos.copy GotoAsIdentifier
+                                    (:) $ warn @mpos GotoAsIdentifier
 
 sem MTokenList MStatList MExprList FieldList VarsList
     | Cons
@@ -305,8 +306,8 @@ sem Block
 
 sem MStat
     | MStat
-        lhs.mtokenPos           = @pos.copy
-        stat.mtokenPos          = @pos.copy
+        lhs.mtokenPos           = @pos
+        stat.mtokenPos          = @pos
 
 sem Stat
     | Def
@@ -373,11 +374,19 @@ sem Stat
         body.isRepeat           = False
         elifs.mtokenPos         = @lhs.mtokenPos
         els.mtokenPos           = @lhs.mtokenPos
-        loc.keywordPos          = Region (rgStart @lhs.mtokenPos) (customAdvanceToken (rgStart @lhs.mtokenPos) If)
+        loc.ifBlockPos          =
+            -- If the if-statement is empty, then the entire region can be used to give the empty-if
+            -- warning. If there are elseifs or if there is an else, then go up to the start of
+            -- that.
+            case (@elifs.elseExists, @els.elseExists) of
+                (False, False) -> @lhs.mtokenPos
+                (True, _) -> Region (rgStart @lhs.mtokenPos) (rgStart @elifs.mtokenPos)
+                (False, True) -> Region (rgStart @lhs.mtokenPos) (rgStart @els.mtokenPos)
+
 
         -- Warn for empty if statements
         +warnings               = if not (lint_emptyBlocks @lhs.config) || @body.statementCount > 0 then id else
-                                    (:) $ warn @loc.keywordPos EmptyIf
+                                    (:) $ warn @loc.ifBlockPos EmptyIf
 
         -- Warn for if statements being put as the only statement in another if-statement
         +warnings               = if not (lint_redundantIfStatements @lhs.config) || @body.statementCount /= 1 || not @body.isIfStatement || @elifs.elseExists || @els.elseExists then id else
@@ -457,10 +466,15 @@ sem Stat
 sem ElseIfList
     | Cons
         lhs.elseExists          = True
+        lhs.mtokenPos =
+            Region
+                (rgStart @hd.mtokenPos)
+                (rgEnd $ if @tl.elseExists then @tl.mtokenPos else @hd.mtokenPos)
 
 sem MElseIf
     | MElseIf
-        elif.mtokenPos          = @pos.copy
+        elif.mtokenPos = @pos
+        lhs.mtokenPos = @pos
 
 sem ElseIf
     | Tuple
@@ -470,27 +484,26 @@ sem ElseIf
         x1.varBeingDefined      = Nothing
         x2.scopes               = M.empty : @x1.scopes
         x2.isRepeat             = False
-        loc.keywordPos          = Region (rgStart @lhs.mtokenPos) (customAdvanceToken (rgStart @lhs.mtokenPos) T.Elseif)
         +warnings               = if not (lint_emptyBlocks @lhs.config) || @x2.statementCount > 0 then id else
-                                    (:) $ warn @loc.keywordPos EmptyElseIf
+                                    (:) $ warn @lhs.mtokenPos EmptyElseIf
 
 sem MElse
     | MElse
         body.isRepeat           = False
-        lhs.mtokenPos           = @pos.copy
+        lhs.mtokenPos           = @pos
 
 sem Else
     | Just
         just.scopes             = M.empty : @lhs.scopes
         lhs.elseExists          = True
-        loc.keywordPos          = Region (rgStart @just.mtokenPos) (customAdvanceToken (rgStart @just.mtokenPos) T.Else)
+        loc.elsePos             = Region (rgStart @just.mtokenPos) (rgEnd @lhs.mtokenPos)
         +warnings               = if not (lint_emptyBlocks @lhs.config) || @just.statementCount > 0 then id else
-                                    (:) $ warn @loc.keywordPos EmptyElse
+                                    (:) $ warn @loc.elsePos EmptyElse
 sem AReturn
     | AReturn
         values.inParentheses    = True
         values.topLevel         = True
-        lhs.mtokenPos           = @pos.copy
+        lhs.mtokenPos           = @pos
     | NoReturn
         lhs.statementCount      = 0
 
@@ -554,8 +567,8 @@ sem PFExprSuffix
 
 sem MExpr
     | MExpr
-        lhs.mtokenPos           = @pos.copy
-        expr.mtokenPos          = @pos.copy
+        lhs.mtokenPos           = @pos
+        expr.mtokenPos          = @pos
 
 sem Expr
     | ANil

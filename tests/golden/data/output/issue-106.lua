@@ -1,5 +1,3 @@
-a(
-    {b},
-    function() end, -- comment
-    function() end
-)
+a({b}, function()
+    -- comment
+end, function() end)

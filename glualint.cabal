@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               glualint
-version:            1.25.0
+version:            1.28.0
 synopsis:           Attempts to fix your syntax erroring Lua files.
 description:
   Linter for Lua, specifically the variant used in Garry's mod.
@@ -14,7 +14,10 @@ maintainer:         fpeijnenburg@gmail.com
 copyright:          Falco Peijnenburg
 category:           Language
 build-type:         Simple
-extra-source-files: README.md
+extra-source-files:
+  README.md
+  tests/golden/data/input/*.lua
+  tests/golden/data/output/*.lua
 
 source-repository head
   type:     git
@@ -23,15 +26,14 @@ source-repository head
 library
   default-language: Haskell2010
   build-depends:
-    , aeson          >=2        && <3
-    , base           >=4.5      && <5
-    , bytestring     >=0.11     && <1
-    , containers     >=0.6      && <1
-    , parsec         >=3        && <4
-    , pretty         >=1.1      && <1.2
-    , uu-parsinglib  >=2.8      && <3
-    , uuagc          >=0.9.40.3 && <0.10
-    , uuagc-cabal    >=1.0.3.0  && <2
+    , aeson        >=2        && <3
+    , base         >=4.5      && <5
+    , bytestring   >=0.11     && <1
+    , containers   >=0.6      && <1
+    , parsec       >=3        && <4
+    , pretty       >=1.1      && <1.2
+    , uuagc        >=0.9.40.3 && <0.10
+    , uuagc-cabal  >=1.0.3.0  && <2
 
   hs-source-dirs:   src
   exposed-modules:
@@ -41,9 +43,9 @@ library
     GLua.ASTInstances
     GLua.Lexer
     GLua.LineLimitParser
+    GLua.ParseError
     GLua.Parser
-    GLua.PSLexer
-    GLua.PSParser
+    GLua.Position
     GLua.TokenTypes
     GLuaFixer.AG.ASTLint
     GLuaFixer.AG.LexLint
@@ -73,6 +75,19 @@ test-suite golden
     , glualint
     , tasty         >=1.4 && <2
     , tasty-golden  >=2.3 && <2.4
+
+  default-language: Haskell2010
+
+test-suite linttest
+  type:             exitcode-stdio-1.0
+  main-is:          Spec.hs
+  hs-source-dirs:   tests/linttest
+  build-depends:
+    , base
+    , bytestring
+    , glualint
+    , tasty        >=1.4  && <2
+    , tasty-hunit  >=0.10 && <0.12
 
   default-language: Haskell2010
 

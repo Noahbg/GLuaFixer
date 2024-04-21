@@ -7,11 +7,10 @@ module {GLua.AG.Token}{}{}
 
 imports
 {
-import Text.ParserCombinators.UU.BasicInstances hiding (pos)
 import GHC.Generics
+import GLua.Position
 }
 
-type TokenList = [Token]
 type MTokenList = [MToken]
 
 -- | Simple token types
@@ -92,8 +91,4 @@ data Token
 data MToken
 	| MToken mpos :: Region mtok :: Token
 
-data Region
-    | Region start :: LineColPos end :: LineColPos
-
 deriving Token : Generic, Eq, Ord
-deriving Region : Generic, Show

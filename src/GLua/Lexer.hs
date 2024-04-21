@@ -1,404 +1,350 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE Rank2Types #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
 
--- | Lex GLua into MTokens
 module GLua.Lexer where
 
-import GLua.AG.Token (MToken (..), Region (..), Token (..))
+import GLua.AG.Token (MToken (..), Token (..))
 
 import Data.Char (ord)
-import Text.ParserCombinators.UU (
-  ExtAlternative (opt, (<<|>)),
-  P,
-  micro,
-  pEnd,
-  pErrors,
-  pMany,
-  pPos,
-  pReturn,
-  pSome,
+import GLua.Position (LineColPos (..), Region (..))
+import Text.Parsec (
+  ParseError,
+  SourcePos,
+  anyChar,
+  char,
+  digit,
+  endOfLine,
+  eof,
+  getPosition,
+  lookAhead,
+  many,
+  many1,
+  manyTill,
+  noneOf,
+  oneOf,
+  option,
+  optionMaybe,
   parse,
-  (<$$>),
-  (<**>),
+  satisfy,
+  sourceColumn,
+  sourceLine,
+  space,
+  string,
+  try,
+  (<?>),
+  (<|>),
  )
-import Text.ParserCombinators.UU.BasicInstances (
-  Error,
-  Insertion (Insertion),
-  LineColPos (..),
-  Str,
-  createStr,
-  pMunch,
-  pSatisfy,
-  pSym,
-  pToken,
- )
-import Text.ParserCombinators.UU.Utils (pDigit)
+import Text.Parsec.Pos (newPos)
+import Text.Parsec.String (Parser)
 
--- | String parser that maintains positions.
-type LParser a = P (Str Char String LineColPos) a
+-- | Region start to SourcePos
+rgStart2sp :: Region -> SourcePos
+rgStart2sp (Region start _) = lcp2sp start
 
--- | Whitespace parser that requires at least one whitespace character
-parseWhitespace :: LParser String
-parseWhitespace = pSome $ pSatisfy (`elem` " \r\n\t") (Insertion "Whitespace" ' ' 5)
+-- | Region end to SourcePos
+rgEnd2sp :: Region -> SourcePos
+rgEnd2sp (Region _ end) = lcp2sp end
 
--- | Whitespace parser that requires 0 or more whitespace characters
-parseOptionalWhitespace :: LParser String
-parseOptionalWhitespace = pMany $ pSatisfy (`elem` " \r\n\t") (Insertion "Whitespace" ' ' 5)
+-- | SourcePos to region
+sp2Rg :: SourcePos -> Region
+sp2Rg sp = Region (sp2lcp sp) (sp2lcp sp)
 
--- | Blanco parser. Parses anything. Used in parsing comments.
-parseAnyChar :: LParser Char
-parseAnyChar = pSatisfy (const True) (Insertion "Any character" 'y' 5)
+-- | LineColPos to SourcePos
+lcp2sp :: LineColPos -> SourcePos
+lcp2sp (LineColPos l c _) = newPos "source.lua" (l + 1) (c + 1)
+
+-- | SourcePos to LineColPos
+sp2lcp :: SourcePos -> LineColPos
+sp2lcp pos = LineColPos (sourceLine pos - 1) (sourceColumn pos - 1) 0
+
+-- | Get the source position
+pPos :: Parser LineColPos
+pPos = sp2lcp <$> getPosition
 
 -- See luajit's src/lj_char.c and src/lj_char.h
-pIdentifierCharacter :: LParser Char
-pIdentifierCharacter = pSatisfy validChar (Insertion "Identifying character (letter, number, emoji)" 'a' 5)
+pIdentifierCharacter :: Parser Char
+pIdentifierCharacter = satisfy validChar
   where
     validChar :: Char -> Bool
     validChar c =
-      between c '0' '9'
-        || between c 'A' 'Z'
+      cBetween c '0' '9'
+        || cBetween c 'A' 'Z'
         || c == '_'
-        || between c 'a' 'z'
+        || cBetween c 'a' 'z'
         || ord c >= 128
 
-pNonDigitIdentifierCharacter :: LParser Char
-pNonDigitIdentifierCharacter = pSatisfy validChar (Insertion "Identifying character (letter, emoji)" 'a' 5)
+pNonDigitIdentifierCharacter :: Parser Char
+pNonDigitIdentifierCharacter = satisfy validChar
   where
     validChar :: Char -> Bool
     validChar c =
-      between c 'A' 'Z'
+      cBetween c 'A' 'Z'
         || c == '_'
-        || between c 'a' 'z'
+        || cBetween c 'a' 'z'
         || ord c >= 128
 
-between :: Char -> Char -> Char -> Bool
-between c left right = c >= left && c <= right
-
--- | Parses a C-style block comment.
-parseCBlockComment :: LParser String
-parseCBlockComment =
-  const "" <$> pToken "*/"
-    <<|> (:) <$> parseAnyChar <*> parseCBlockComment
-
--- | Try to parse a block comment.
--- Might actually return a single line Dash comment, because for example
--- the following line is a line comment, rather than a block comment
--- [===== <- missing the last '[' bracket.
-parseBlockComment :: LParser Token
-parseBlockComment = pToken "[" *> nested 0
-  where
-    -- The amount of =-signs in the string delimiter is n
-    nested :: Int -> LParser Token
-    nested n =
-      pToken "=" *> nested (n + 1)
-        <<|> DashBlockComment n <$ pToken "[" <*> restString n
-        <<|> lineComment n <$> pUntilEnd
-
-    -- Turns out we were describing a line comment all along, cheeky bastard!
-    -- (the last [ of the block comment start token is missing)
-    lineComment :: Int -> String -> Token
-    lineComment n str = DashComment $ '[' : replicate n '=' ++ str
-
-    -- Right-recursive grammar. This part searches for the rest of the string until it finds the ]=^n] token
-    restString :: Int -> LParser String
-    restString n =
-      const "" <$> pToken ("]" ++ replicate n '=' ++ "]")
-        <<|> (:) <$> parseAnyChar <*> restString n
+cBetween :: Char -> Char -> Char -> Bool
+cBetween c left right = c >= left && c <= right
 
 -- | Parse the string until the end. Used in parseLineComment among others.
-pUntilEnd :: LParser String
-pUntilEnd = pMunch (\c -> c /= '\n' && c /= '\r')
+pUntilEnd :: Parser String
+pUntilEnd = manyTill anyChar (lookAhead (endOfLine <|> const '\n' <$> eof))
 
--- | A comment that spans until the end of the line.
-parseLineComment :: String -> LParser String
-parseLineComment prefix = flip const <$> pToken prefix <*> pUntilEnd
+-- | Whitespace parser that requires at least one whitespace character
+parseWhitespace :: Parser String
+parseWhitespace = many1 space <?> "whitespace"
 
--- | Parses a multiline string except for its first character (e.g. =[ string ]=])
--- This is because the first [ could also just be parsed as a square bracket.
-nestedString :: LParser String
-nestedString = nested 0
+-- | Whitespace parser that requires 0 or more whitespace characters
+parseOptionalWhitespace :: Parser String
+parseOptionalWhitespace = many space <?> "whitespace"
+
+-- | An escaped character of a single line string
+-- Takes the delimiter of the string as parameter
+escapedStringChar :: Char -> Parser String
+escapedStringChar delim = (\escaped -> '\\' : escaped) <$ char '\\' <*> escapedChar <|> (: []) <$> noneOf ['\n', delim]
   where
-    -- The amount of =-signs in the string delimiter is n
-    nested :: Int -> LParser String
-    nested n =
-      (\str -> "=" ++ str) <$ pToken "=" <*> nested (n + 1)
-        <<|> ('[' :) <$ pToken "[" <*> restString n
+    escapedChar = (:) <$> char 'z' <*> parseOptionalWhitespace <|> (: []) <$> anyChar
 
-    -- Right-recursive grammar. This part searches for the rest of the string until it finds the ]=^n] token
-    restString :: Int -> LParser String
-    restString n =
-      pToken ("]" ++ replicate n '=' ++ "]")
-        <<|> (:) <$> parseAnyChar <*> restString n
+-- | The start of a nested string
+-- Returns the amount of =-signs at the start of the nested string
+startNestedString :: Parser String
+startNestedString = do
+  _ <- char '['
+  depth <- many (char '=')
+  _ <- char '['
+  return depth
+
+-- | Parses a multiline string
+-- returns the amount of =-signs in the string delimiter and the contents
+nestedString :: String -> Parser String
+nestedString depth = do
+  let
+    endStr = "]" ++ depth ++ "]"
+  manyTill anyChar (try $ string endStr)
+
+-- | Parse Lua style comments
+parseLuaComment :: Parser Token
+parseLuaComment = do
+  _ <- string "--"
+  -- When a nested comment is started, it must be finished
+  startNested <- optionMaybe (try startNestedString)
+
+  case startNested of
+    Nothing -> DashComment <$> pUntilEnd
+    Just depth -> do
+      contents <- nestedString depth
+      return $ DashBlockComment (length depth) contents
+
+-- | Parse C-Style comments
+parseCComment :: Parser Token
+parseCComment = do
+  _ <- char '/'
+  try (SlashComment <$ char '/' <*> pUntilEnd)
+    <|> SlashBlockComment <$ char '*' <*> manyTill anyChar (try (string "*/") <|> const "\n" <$> eof)
 
 -- | Parse any kind of comment.
-parseComment :: LParser Token
-parseComment =
-  pToken "--"
-    <**> (const <$> (parseBlockComment <<|> DashComment <$> pUntilEnd)) -- Dash block comment and dash comment both start with "--"
-    <<|> pToken "/"
-      <**> ( const
-              <$> ( SlashBlockComment <$ pToken "*" <*> parseCBlockComment
-                      <<|> SlashComment <$> parseLineComment "/"
-                      <<|> pReturn Divide -- The /-sign is here because it also starts with '/'
-                  )
-           )
+parseComment :: Parser Token
+parseComment = parseLuaComment <|> parseCComment <?> "Comment"
+
+-- | Convert the result of the nestedString parser to a MultiLine string
+nestedStringToMLString :: String -> String -> Token
+nestedStringToMLString depth contents = MLString (showChar '[' . showString depth . showChar '[' . showString contents . showChar ']' . showString depth . showChar ']' $ "")
 
 -- | Parse single line strings e.g. "sdf", 'werf'.
-parseLineString :: Char -> LParser String
-parseLineString c = pSym c *> innerString
-  where
-    innerString :: LParser String
-    innerString =
-      pSym '\\'
-        <**> ((\c' str esc -> esc : c' ++ str) <$> escapeSequence <*> innerString) -- Escaped character in string always starts with backslash
-        <<|> const "" <$> pSym c
-        <<|> (:) <$> pNoNewline <*> innerString -- the end of the string
-        -- the next character in the string
-    escapeSequence :: LParser String
-    escapeSequence = (:) <$> pSym 'z' <*> parseOptionalWhitespace <<|> (: []) <$> parseAnyChar
-
-    pNoNewline :: LParser Char
-    pNoNewline = pSatisfy (/= '\n') (Insertion "Anything but a newline" c 5)
+parseLineString :: Char -> Parser String
+parseLineString c = concat <$ char c <*> many (escapedStringChar c) <* char c
 
 -- | Single and multiline strings.
-parseString :: LParser Token
+parseString :: Parser Token
 parseString =
-  DQString <$> parseLineString '"'
-    <<|> SQString <$> parseLineString '\''
-    <<|>
-    -- Parse either a multiline string or just a bracket.
-    -- Placed here because they have the first token '[' in common
-    pSym '['
-      <**> ( (\_ -> MLString . (:) '[')
-              <$$> nestedString
-              <<|> const
-              <$> pReturn LSquare
-           )
+  SQString <$> parseLineString '\''
+    <|> DQString <$> parseLineString '"'
+    <|> do
+      depth <- startNestedString
+      nestedStringToMLString depth <$> nestedString depth <?> "String"
 
 -- | Parse any kind of number.
-parseNumber :: LParser Token
-parseNumber = TNumber <$> ((++) <$> (pZeroPrefixedNumber <<|> pNumber) <*> (pLLULL <<|> opt parseNumberSuffix ""))
+-- Except for numbers that start with a '.'. That's handled by parseDots to solve ambiguity.
+parseNumber :: Parser Token
+parseNumber = TNumber <$> ((++) <$> (pHexadecimal <|> pBinary <|> pNumber) <*> (pLLULL <|> option "" parseNumberSuffix)) <?> "Number"
   where
-    -- Numbers starting with 0 can be regular numbers, hexadecimals or binary
-    pZeroPrefixedNumber :: LParser String
-    pZeroPrefixedNumber =
-      pSym '0'
-        <**> ( (\hex _0 -> _0 : hex) <$> pHexadecimal
-                <<|> (\bin _0 -> _0 : bin) <$> pBinary
-                <<|> (\digits _0 -> _0 : digits) <$> (pDecimal <<|> pNumber)
-                <<|> pure (: [])
-             )
+    pNumber :: Parser String
+    pNumber = (++) <$> many1 digit <*> option "" pDecimal
 
-    pNumber :: LParser String
-    pNumber = (++) <$> pSome pDigit <*> opt pDecimal ""
+    pDecimal :: Parser String
+    pDecimal = (:) <$> char '.' <*> many digit
 
-    pDecimal :: LParser String
-    pDecimal = (:) <$> pSym '.' <*> pMany pDigit
+    pHexDecimal :: Parser String
+    pHexDecimal = (:) <$> char '.' <*> many pHex
 
-    pHexDecimal :: LParser String
-    pHexDecimal = (:) <$> pSym '.' <*> pMany pHex
+    pHexadecimal :: Parser String
+    pHexadecimal = (++) <$> (try (string "0x") <|> try (string "0X")) <*> ((++) <$> many1 pHex <*> option "" pHexDecimal)
 
-    pHexadecimal :: LParser String
-    pHexadecimal = (:) <$> (pSym 'x' <<|> pSym 'X') <*> ((++) <$> pSome pHex <*> opt pHexDecimal "")
+    pHex :: Parser Char
+    pHex = digit <|> oneOf ['a', 'b', 'c', 'd', 'e', 'f', 'A', 'B', 'C', 'D', 'E', 'F']
 
-    pBinary :: LParser String
-    pBinary = (:) <$> (pSym 'b' <<|> pSym 'B') <*> ((++) <$> pSome pBin <*> opt pDecimal "")
+    pBinary :: Parser String
+    pBinary = (++) <$> (try (string "0b") <|> try (string "0B")) <*> ((++) <$> many1 pBin <*> option "" pDecimal)
 
-    pHex :: LParser Char
-    pHex =
-      pDigit
-        <<|> pSym 'a'
-        <<|> pSym 'b'
-        <<|> pSym 'c'
-        <<|> pSym 'd'
-        <<|> pSym 'e'
-        <<|> pSym 'f'
-        <<|> pSym 'A'
-        <<|> pSym 'B'
-        <<|> pSym 'C'
-        <<|> pSym 'D'
-        <<|> pSym 'E'
-        <<|> pSym 'F'
-
-    pBin :: LParser Char
-    pBin = pSym '0' <<|> pSym '1'
+    pBin :: Parser Char
+    pBin = digit <|> oneOf ['0', '1']
 
     -- LL/ULL suffix of a number, making it signed/unsigned int64 respectively
     -- http://luajit.org/ext_ffi_api.html#literals
-    pLLULL :: LParser String
-    pLLULL = pULL <<|> pLL
+    pLLULL :: Parser String
+    pLLULL = pULL <|> pLL
 
-    pLL :: LParser String
-    pLL = "LL" <$ (pSym 'L' <<|> pSym 'l') <* (pSym 'L' <<|> pSym 'l')
+    pLL :: Parser String
+    pLL = "LL" <$ oneOf ['L', 'l'] <* oneOf ['L', 'l']
 
-    pULL :: LParser String
-    pULL = "ULL" <$ (pSym 'U' <<|> pSym 'u') <* pLL
+    pULL :: Parser String
+    pULL = "ULL" <$ oneOf ['U', 'u'] <* pLL
 
 -- Parse the suffix of a number
-parseNumberSuffix :: LParser String
-parseNumberSuffix = imaginary <<|> extension
+parseNumberSuffix :: Parser String
+parseNumberSuffix = imaginary <|> extension
   where
-    imaginary = (: []) <$> (pSym 'i' <<|> pSym 'I')
-
+    imaginary = (: []) <$> oneOf ['i', 'I']
     extension =
       (\e s d -> e : s ++ d)
-        <$> (pSym 'e' <<|> pSym 'E' <<|> pSym 'p' <<|> pSym 'P')
-        <*> opt (pToken "+" <<|> pToken "-") ""
-        <*> pSome pDigit
+        <$> oneOf ['e', 'E', 'p', 'P']
+        <*> option "" (string "+" <|> string "-")
+        <*> many1 digit
 
--- | Parse a keyword. Note: It must really a key/word/! This parser makes sure to return an identifier when
--- it's actually an identifier that starts with that keyword.
-parseKeyword :: Token -> String -> LParser Token
-parseKeyword tok word =
-  pToken word
-    <**> ((\k -> Identifier . (++) k) <$$> pSome pIdentifierCharacter <<|> const <$> pReturn tok)
+-- | Parse either a keyword or an identifier that starts with that keyword
+parseKeyword :: Token -> String -> Parser Token
+parseKeyword tok str =
+  try
+    ( do
+        _ <- string str
+        (\s -> Identifier (str ++ s)) <$> many1 (pIdentifierCharacter)
+          <|> return tok
+        <?> "Keyword "
+        ++ str
+    )
 
 -- | Parse just an identifier.
-parseIdentifier :: LParser String
-parseIdentifier = (:) <$> pNonDigitIdentifierCharacter <*> pMany pIdentifierCharacter
+parseIdentifier :: Parser String
+parseIdentifier = (:) <$> pNonDigitIdentifierCharacter <*> many pIdentifierCharacter <?> "Identifier"
 
 -- | Parse a label.
-parseLabel :: LParser Token
+parseLabel :: Parser Token
 parseLabel =
   Label
-    <$ pToken "::"
+    <$ string "::"
     <*> parseOptionalWhitespace
     <*> parseIdentifier
     <*> parseOptionalWhitespace
-    <* pToken "::"
+    <* string "::"
+    <?> "Label"
 
--- | Parse anything to do with dots. Indexaction (.), concatenation (..) or varargs (...)
-parseDots :: LParser Token
-parseDots =
-  pToken "."
-    <**> ( -- A dot means it's either a VarArg (...), concatenation (..) or just a dot (.)
-           const
-            <$> ( pToken "."
-                    <**> ( const VarArg <$ pToken "."
-                            <<|> const <$> pReturn Concatenate
-                         )
-                )
-            <<|> (\ds sfx dot -> TNumber $ dot ++ ds ++ sfx) <$> pSome pDigit <*> opt parseNumberSuffix ""
-            <<|> const <$> pReturn Dot
-         )
+-- | Parse anything to do with dots. Indexaction (.), concatenation (..), varargs (...) or numbers that start with a dot
+parseDots :: Parser Token
+parseDots = do
+  _ <- char '.' -- first .
+  try
+    ( do
+        _ <- char '.' -- second .
+        try (VarArg <$ char '.')
+          <|> return Concatenate -- third .
+    )
+    <|>
+    -- try to parse a number that starts with a .
+    try
+      ( do
+          nums <- many1 digit
+          suffix <- option "" parseNumberSuffix
+          return $ TNumber ('.' : (nums ++ suffix))
+      )
+    <|> return Dot
 
 -- | Parse any kind of token.
-parseToken :: LParser Token
+parseToken :: Parser Token
 parseToken =
-  parseComment
-    <<|>
+  Whitespace <$> parseWhitespace
+    <|>
     -- Constants
-    parseString
-    <<|> parseNumber
-    <<|> parseKeyword TTrue "true"
-    <<|> parseKeyword TFalse "false"
-    <<|> parseKeyword Nil "nil"
-    <<|> parseKeyword Not "not"
-    <<|> parseKeyword And "and"
-    <<|> parseKeyword Or "or"
-    <<|> parseKeyword Function "function"
-    <<|> parseKeyword Local "local"
-    <<|> parseKeyword If "if"
-    <<|> parseKeyword Then "then"
-    <<|> parseKeyword Elseif "elseif"
-    <<|> parseKeyword Else "else"
-    <<|> parseKeyword For "for"
-    <<|> parseKeyword In "in"
-    <<|> parseKeyword Do "do"
-    <<|> parseKeyword While "while"
-    <<|> parseKeyword Until "until"
-    <<|> parseKeyword Repeat "repeat"
-    <<|> parseKeyword Continue "continue"
-    <<|> parseKeyword Break "break"
-    <<|> parseKeyword Return "return"
-    <<|> parseKeyword End "end"
-    <<|> Identifier
-    <$> parseIdentifier
-    <<|> Semicolon
-    <$ pToken ";"
-    <<|> parseDots
-    <<|>
+    try parseString
+    <|> parseNumber
+    <|> parseKeyword TTrue "true"
+    <|> parseKeyword TFalse "false"
+    <|> parseKeyword Nil "nil"
+    <|> parseKeyword Not "not"
+    <|> parseKeyword And "and"
+    <|> parseKeyword Or "or"
+    <|> parseKeyword Function "function"
+    <|> parseKeyword Local "local"
+    <|> parseKeyword If "if"
+    <|> parseKeyword Then "then"
+    <|> parseKeyword Elseif "elseif"
+    <|> parseKeyword Else "else"
+    <|> parseKeyword For "for"
+    <|> parseKeyword In "in"
+    <|> parseKeyword Do "do"
+    <|> parseKeyword While "while"
+    <|> parseKeyword Until "until"
+    <|> parseKeyword Repeat "repeat"
+    <|> parseKeyword Continue "continue"
+    <|> parseKeyword Break "break"
+    <|> parseKeyword Return "return"
+    <|> parseKeyword End "end"
+    <|> Identifier <$> parseIdentifier
+    <|> Semicolon <$ char ';'
+    <|> parseDots
+    <|> try parseComment
+    <|>
     -- Operators
-    Plus
-    <$ pToken "+"
-    <<|> Minus
-    <$ pToken "-"
-    <<|> Multiply
-    <$ pToken "*"
-    <<|> Modulus
-    <$ pToken "%"
-    <<|> Power
-    <$ pToken "^"
-    <<|> TEq
-    <$ pToken "=="
-    <<|> Equals
-    <$ pToken "="
-    <<|> TNEq
-    <$ pToken "~="
-    <<|> TCNEq
-    <$ pToken "!="
-    <<|> CNot
-    <$ pToken "!"
-    <<|> TLEQ
-    <$ pToken "<="
-    <<|> TLT
-    <$ pToken "<"
-    <<|> TGEQ
-    <$ pToken ">="
-    <<|> TGT
-    <$ pToken ">"
-    <<|> parseLabel
-    <<|> Colon
-    <$ pToken ":"
-    <<|> Comma
-    <$ pToken ","
-    <<|> Hash
-    <$ pToken "#"
-    `micro` 10
-    <<|> CAnd -- Add micro cost to prevent conflict with parseHashBang
-    <$ pToken "&&"
-    <<|> COr
-    <$ pToken "||"
-    <<|> LRound
-    <$ pToken "("
-    <<|> RRound
-    <$ pToken ")"
-    <<|> LCurly
-    <$ pToken "{"
-    <<|> RCurly
-    <$ pToken "}"
-    <<|>
-    -- Other square bracket is parsed in parseString
-    RSquare
-    <$ pToken "]"
-    <<|> Whitespace
-    <$> parseWhitespace
+    Plus <$ string "+"
+    <|> Minus <$ string "-"
+    <|> Multiply <$ string "*"
+    <|> Divide <$ string "/"
+    <|> Modulus <$ string "%"
+    <|> Power <$ string "^"
+    <|> TEq <$ try (string "==")
+    <|> Equals <$ string "="
+    <|> TNEq <$ string "~="
+    <|> TCNEq <$ try (string "!=")
+    <|> CNot <$ string "!"
+    <|> TLEQ <$ try (string "<=")
+    <|> TLT <$ string "<"
+    <|> TGEQ <$ try (string ">=")
+    <|> TGT <$ string ">"
+    <|> try parseLabel
+    <|> Colon <$ string ":"
+    <|> Comma <$ string ","
+    <|> Hash <$ string "#"
+    <|> CAnd <$ string "&&"
+    <|> COr <$ string "||"
+    <|> LRound <$ char '('
+    <|> RRound <$ char ')'
+    <|> LCurly <$ char '{'
+    <|> RCurly <$ char '}'
+    <|> LSquare <$ char '['
+    <|> RSquare <$ char ']'
 
 -- | A thing of which the region is to be parsed
-annotated :: (Region -> a -> b) -> LParser a -> LParser b
+annotated :: (Region -> a -> b) -> Parser a -> Parser b
 annotated f p = (\s t e -> f (Region s e) t) <$> pPos <*> p <*> pPos
 
 -- | parse located MToken
-parseMToken :: LParser MToken
-parseMToken = annotated MToken parseToken
+parseMToken :: Parser MToken
+parseMToken =
+  do
+    start <- pPos
+    tok <- parseToken
+    end <- pPos
+
+    return $ MToken (Region start end) tok
 
 -- | Parse a list of tokens and turn them into MTokens.
-parseTokens :: LParser [MToken]
-parseTokens = pMany parseMToken
+parseTokens :: Parser [MToken]
+parseTokens = many parseMToken
 
 -- | Parse the potential #!comment on the first line
 -- Lua ignores the first line if it starts with #
-parseHashBang :: LParser String
-parseHashBang = opt (pToken "#" <* pUntilEnd) ""
+parseHashBang :: Parser String
+parseHashBang = option "" (char '#' *> pUntilEnd)
 
--- | Lex a string with a given lexer
-lexFromString :: LParser a -> String -> (a, [Error LineColPos])
-lexFromString p = parse ((,) <$> p <*> pErrors <* pEnd) . createStr (LineColPos 0 0 0)
-
--- | Parse a string into MTokens. Also returns parse errors.
-execParseTokens :: String -> ([MToken], [Error LineColPos])
-execParseTokens = parse ((,) <$ parseHashBang <*> parseTokens <*> pErrors <* pEnd) . createStr (LineColPos 0 0 0)
+-- | Parse a string into MTokens.
+execParseTokens :: String -> Either ParseError [MToken]
+execParseTokens = parse (parseHashBang *> parseTokens <* eof) "input"
